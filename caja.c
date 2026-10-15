@@ -20,13 +20,18 @@
 #include <sched.h>
 #include <semaphore.h>
 #include <sys/mman.h>
+#include <poll.h>
+#include <signal.h>
 
 #define MAX_SOLICITUD 256
 #define MAX_TAREAS    100
 #define AL_AZAR       (-1.0)   /* valor que significa "sortealo tu, Meeseeks" */
 #define MAX_HIJOS     5
 #define ANEJAMIENTO   1.20     /* cada nivel la tarea se vuelve 20% mas facil */
-#define MAX_NIVEL     4        /* freno TEMPORAL: nadie crea hijos mas alla de este nivel */
+#define CANSANCIO     1.25     /* cada reintento sin ayuda dura 25% mas...      */
+#define ESPERA_MAX    10.0     /* ...hasta un maximo de 10 s por intento        */
+#define MINUTOS_DEF   5.0      /* tiempo maximo por defecto (caos planetario)   */
+#define CUPO_DEF      200      /* Meeseeks vivos permitidos por defecto         */
 
 /* Mensaje privado que baja por el pipe: del padre al Mr. Meeseeks. */
 typedef struct {
@@ -40,6 +45,7 @@ typedef struct {
     int    ok;           /* 1 = solicitud completada */
     double espera;       /* segundos dormidos en la simulacion (se restan del tiempo) */
     int    creados;      /* Mr. Meeseeks en este subarbol (yo + mis descendientes) */
+    int    cancelado;    /* 1 = me ordenaron terminar antes de acabar */
     pid_t  pid, ppid;    /* datos del Mr. Meeseeks que resolvio la solicitud */
     int    N, i;
 } Resultado;
@@ -59,6 +65,8 @@ typedef struct {
     int   max_vivos;                /* el mayor valor que alcanzo "vivos"      */
     int   nivel_max;                /* nivel mas profundo alcanzado            */
     int   por_nivel[NIVELES_REG];   /* cuantos se crearon en cada nivel        */
+    int   cupo;                     /* maximo de Meeseeks vivos (contingencia) */
+    int   sin_cupo;                 /* veces que alguien pidio ayuda y no hubo cupo */
 } Compartido;
 
 static Compartido *shm;   /* puntero a la memoria compartida */
@@ -75,35 +83,59 @@ static void desbloquear(void) {
 #endif
 }
 
+/* PLAN DE CONTINGENCIA: antes de crear hijos, el padre reserva su lugar
+ * en el contador "vivos". Si no caben todos, no se crea ninguno.
+ * Asi nunca existen mas de shm->cupo Mr. Meeseeks al mismo tiempo.
+ * Devuelve 1 si obtuvo el cupo. */
+static int reservar_cupo(int cantidad) {
+    int obtenido = 0;
+    bloquear();
+    int v = shm->vivos;
+    sched_yield();
+    if (v + cantidad <= shm->cupo) {
+        shm->vivos = v + cantidad;
+        if (shm->vivos > shm->max_vivos) shm->max_vivos = shm->vivos;
+        obtenido = 1;
+    } else {
+        shm->sin_cupo++;
+    }
+    desbloquear();
+    return obtenido;
+}
+
+/* Devuelve lugares reservados que no se usaron (por ejemplo, si fork fallo),
+ * o el lugar de un Meeseeks que desaparece. */
+static void liberar_cupo(int cantidad) {
+    bloquear();
+    int v = shm->vivos;
+    sched_yield();
+    shm->vivos = v - cantidad;
+    desbloquear();
+}
+
 /* Un Meeseeks nace: se anota en los contadores (seccion critica).
+ * Su lugar en "vivos" ya lo reservo su padre con reservar_cupo().
  * Se usa leer -> ceder CPU -> escribir para que, sin semaforo, la condicion
  * de carrera sea visible en los experimentos. */
 static void registrar_nacimiento(int N) {
     bloquear();
     int c = shm->creados;
-    int v = shm->vivos;
     sched_yield();
     shm->creados = c + 1;
-    shm->vivos   = v + 1;
-    if (shm->vivos > shm->max_vivos) shm->max_vivos = shm->vivos;
-    if (N > shm->nivel_max)          shm->nivel_max = N;
-    if (N < NIVELES_REG)             shm->por_nivel[N]++;
+    if (N > shm->nivel_max) shm->nivel_max = N;
+    if (N < NIVELES_REG)    shm->por_nivel[N]++;
     desbloquear();
 }
 
-/* Un Meeseeks desaparece. */
+/* Un Meeseeks desaparece: libera su lugar. */
 static void registrar_muerte(void) {
-    bloquear();
-    int v = shm->vivos;
-    sched_yield();
-    shm->vivos = v - 1;
-    desbloquear();
+    liberar_cupo(1);
 }
 
 /* El Box deja los contadores en cero antes de cada solicitud. */
 static void reiniciar_contadores(void) {
     bloquear();
-    shm->creados = shm->vivos = shm->max_vivos = shm->nivel_max = 0;
+    shm->creados = shm->vivos = shm->max_vivos = shm->nivel_max = shm->sin_cupo = 0;
     memset(shm->por_nivel, 0, sizeof shm->por_nivel);
     desbloquear();
 }
@@ -116,6 +148,7 @@ typedef struct {
     int    meeseeks;     /* cuantos Mr. Meeseeks se crearon para esta tarea */
     int    max_vivos;    /* cuantos existieron al mismo tiempo, como maximo */
     int    nivel_max;    /* nivel mas profundo alcanzado */
+    int    caos;         /* 1 = se acabo el tiempo maximo (caos planetario) */
 } Tarea;
 
 static Tarea bitacora[MAX_TAREAS];
@@ -131,7 +164,7 @@ static void informe(void) {
     for (int k = 0; k < total; k++) {
         printf("%-3d %-30.30s %12.6f %-10s %8d %6d %6d\n", k + 1, bitacora[k].texto,
                bitacora[k].duracion,
-               bitacora[k].completada ? "Terminada" : "Fallida",
+               bitacora[k].caos ? "CAOS" : bitacora[k].completada ? "Terminada" : "Fallida",
                bitacora[k].meeseeks, bitacora[k].max_vivos, bitacora[k].nivel_max);
         hechas += bitacora[k].completada;
     }
@@ -169,20 +202,42 @@ static double dificultad_al_azar(void) {
     return d;
 }
 
-/* Duerme los segundos indicados (admite decimales). */
-static void dormir(double segundos) {
-    struct timespec t;
-    t.tv_sec  = (time_t)segundos;
-    t.tv_nsec = (long)((segundos - t.tv_sec) * 1e9);
-    nanosleep(&t, NULL);
+/* ------------------------------------------------------------------
+ * Orden de terminar.
+ * El pipe por donde el padre envio el Mensaje queda ABIERTO. Si despues el
+ * padre escribe un byte 'T' en el (o el pipe se cierra porque el padre murio),
+ * el hijo sabe que debe despedirse y terminar.
+ * ------------------------------------------------------------------ */
+#define ORDEN_TERMINAR 'T'
+
+/* Duerme hasta "segundos", pero se despierta antes si llega la orden de
+ * terminar por fd_orden. Devuelve 1 si llego la orden. En *dormido deja
+ * cuanto tiempo durmio realmente. */
+static int esperar_o_terminar(int fd_orden, double segundos, double *dormido) {
+    double inicio = ahora();
+    double resta  = segundos;
+    int    orden  = 0;
+
+    while (resta > 0) {
+        struct pollfd p = { .fd = fd_orden, .events = POLLIN };
+        int listo = poll(&p, 1, (int)(resta * 1000) + 1);
+        if (listo > 0) {                 /* llego un byte 'T' o el padre cerro el pipe */
+            orden = 1;
+            break;
+        }
+        resta = segundos - (ahora() - inicio);
+    }
+    *dormido = ahora() - inicio;
+    if (*dormido > segundos) *dormido = segundos;
+    return orden;
 }
 
 /* Simula el intento de un Mr. Meeseeks de cumplir una solicitud textual.
- * Duerme "espera" segundos y luego decide. Devuelve 1 si lo logro. */
-static int intentar_tarea(double dificultad, double espera) {
+ * Devuelve 1 si lo logro, 0 si no, -1 si le ordenaron terminar mientras trabajaba. */
+static int intentar_tarea(double dificultad, double espera, int fd_orden, double *dormido) {
     printf("[pid %d, ppid %d] Dificultad %.2f. Trabajando %.2f s...\n",
            getpid(), getppid(), dificultad, espera);
-    dormir(espera);
+    if (esperar_o_terminar(fd_orden, espera, dormido)) return -1;
 
     if (dificultad > 85.0) {           /* 85.01 a 100: un solo Meeseeks basta */
         printf("[pid %d, ppid %d] Era facil, puedo solo!\n", getpid(), getppid());
@@ -199,10 +254,24 @@ static int intentar_tarea(double dificultad, double espera) {
 
 static void meeseeks(int fd_entrada, int fd_salida, int N, int i);
 
+/* Envia la orden de terminar a todos los hijos que siguen activos,
+ * excepto al hijo "menos" (el que lo resolvio; -1 para avisar a todos). */
+static void avisar_hijos(int escribe[], pid_t pids[], int activo[], int creados, int menos) {
+    char orden = ORDEN_TERMINAR;
+    for (int k = 0; k < creados; k++) {
+        if (!activo[k] || k == menos) continue;
+        printf("[pid %d, ppid %d] -> Mr. Meeseeks %d: ya no hace falta, puedes irte.\n",
+               getpid(), getppid(), pids[k]);
+        if (write(escribe[k], &orden, 1) < 0) { /* el hijo ya habia terminado */ }
+    }
+}
+
 /* Parte A completa: el Mr. Meeseeks intenta la tarea y, si no puede, crea
  * otros Mr. Meeseeks (nivel N+1) y espera lo que le respondan por pipe.
- * fd_salida es el pipe hacia MI padre: mis hijos lo heredan y deben cerrarlo. */
-static void resolver_textual(const Mensaje *m, int N, int i, int fd_salida, Resultado *r) {
+ * fd_entrada: pipe desde mi padre (por ahi puede llegar la orden de terminar).
+ * fd_salida : pipe hacia mi padre. Mis hijos heredan ambos y deben cerrarlos. */
+static void resolver_textual(const Mensaje *m, int N, int i,
+                             int fd_entrada, int fd_salida, Resultado *r) {
     double dificultad = m->dificultad;
     if (dificultad == AL_AZAR) {
         dificultad = dificultad_al_azar();
@@ -211,24 +280,42 @@ static void resolver_textual(const Mensaje *m, int N, int i, int fd_salida, Resu
     }
     double espera = (m->espera == AL_AZAR) ? azar(0.5, 5.0) : m->espera;
 
-    r->espera = espera;
-    if (intentar_tarea(dificultad, espera)) {
-        r->ok   = 1;                       /* yo mismo la resolvi */
-        r->pid  = getpid();
-        r->ppid = getppid();
-        r->N    = N;
-        r->i    = i;
-        return;
-    }
+    int cantidad;
+    r->espera = 0.0;
 
-    if (N >= MAX_NIVEL) {
-        printf("[pid %d, ppid %d] Ya somos demasiados niveles (%d), no pido mas ayuda.\n",
-               getpid(), getppid(), N);
-        return;
-    }
+    for (;;) {
+        double dormido;
+        int intento = intentar_tarea(dificultad, espera, fd_entrada, &dormido);
+        r->espera += dormido;
 
-    /* --- Pide ayuda: 5 hijos si es muy dificil (0-45), 2 si es intermedia (45.01-85) --- */
-    int cantidad = (dificultad <= 45.0) ? 5 : 2;
+        if (intento == -1) {           /* me avisaron mientras trabajaba */
+            r->cancelado = 1;
+            return;
+        }
+        if (intento == 1) {
+            r->ok   = 1;               /* yo mismo la resolvi */
+            r->pid  = getpid();
+            r->ppid = getppid();
+            r->N    = N;
+            r->i    = i;
+            return;
+        }
+
+        /* Pide ayuda: 5 hijos si es muy dificil (0-45), 2 si es intermedia (45.01-85) */
+        cantidad = (dificultad <= 45.0) ? 5 : 2;
+        if (reservar_cupo(cantidad)) break;           /* hay lugar: a crear hijos */
+
+        /* CONTINGENCIA: no caben mas Meeseeks. Lo reintento yo solo; con la
+         * practica la tarea se me facilita (anejamiento) pero me canso y
+         * cada intento dura mas. Una tarea imposible (0) nunca mejora. */
+        dificultad *= ANEJAMIENTO;
+        if (dificultad > 100.0) dificultad = 100.0;
+        espera *= CANSANCIO;
+        if (espera > ESPERA_MAX) espera = ESPERA_MAX;
+        printf("[pid %d, ppid %d] No hay cupo para %d ayudantes (maximo %d). "
+               "Lo intento otra vez yo solo, mas cansado...\n",
+               getpid(), getppid(), cantidad, shm->cupo);
+    }
 
     /* Anejamiento: la tarea se simplifica para el siguiente nivel.
      * Al ser una multiplicacion, una tarea imposible (0) sigue siendo 0. */
@@ -240,13 +327,16 @@ static void resolver_textual(const Mensaje *m, int N, int i, int fd_salida, Resu
            getpid(), getppid(), cantidad, N + 1, para_hijo.dificultad);
 
     pid_t pids[MAX_HIJOS];
-    int   lee[MAX_HIJOS];    /* extremo de lectura del pipe "sube" de cada hijo */
+    int   lee[MAX_HIJOS];      /* pipe "sube" de cada hijo: por ahi llega su Resultado */
+    int   escribe[MAX_HIJOS];  /* pipe "baja" de cada hijo: Mensaje y luego la orden 'T' */
+    int   activo[MAX_HIJOS];
     int   creados = 0;
 
     for (int k = 0; k < cantidad; k++) {
         int baja[2], sube[2];
         if (pipe(baja) < 0) { perror("pipe"); break; }
         if (pipe(sube) < 0) { perror("pipe"); close(baja[0]); close(baja[1]); break; }
+        /* (si algo falla, el break deja creados < cantidad y se libera el sobrante) */
 
         pid_t pid = fork();
         if (pid < 0) {
@@ -259,41 +349,80 @@ static void resolver_textual(const Mensaje *m, int N, int i, int fd_salida, Resu
             /* hijo: cierra todo lo heredado que no le pertenece */
             close(baja[1]);
             close(sube[0]);
-            close(fd_salida);                              /* pipe de mi padre a mi abuelo */
-            for (int j = 0; j < creados; j++) close(lee[j]);   /* pipes de mis hermanos */
-            meeseeks(baja[0], sube[1], N + 1, k + 1);      /* nunca retorna */
+            close(fd_entrada);                         /* pipes entre mi padre y mi abuelo */
+            close(fd_salida);
+            for (int j = 0; j < creados; j++) {        /* pipes de mis hermanos */
+                close(lee[j]);
+                close(escribe[j]);
+            }
+            meeseeks(baja[0], sube[1], N + 1, k + 1);  /* nunca retorna */
         }
 
-        /* padre: le pasa la solicitud por mensaje privado */
+        /* padre: le pasa la solicitud por mensaje privado y deja el pipe abierto */
         close(baja[0]);
         close(sube[1]);
         if (write(baja[1], &para_hijo, sizeof para_hijo) < 0) perror("write");
-        close(baja[1]);
 
-        pids[creados] = pid;
-        lee[creados]  = sube[0];
+        pids[creados]    = pid;
+        lee[creados]     = sube[0];
+        escribe[creados] = baja[1];
+        activo[creados]  = 1;
         creados++;
     }
 
-    /* --- Espera la respuesta de cada hijo --- */
+    if (creados < cantidad) liberar_cupo(cantidad - creados);   /* cupo no usado */
+
+    /* --- Espera respuestas con poll: de cualquiera de mis hijos o de mi padre --- */
     double espera_hijos = 0.0;
-    for (int k = 0; k < creados; k++) {
-        Resultado h;
-        if (read(lee[k], &h, sizeof h) == sizeof h) {
-            r->creados += h.creados;
-            if (h.espera > espera_hijos) espera_hijos = h.espera;
-            if (h.ok && !r->ok) {          /* me quedo con el primero que lo logro */
-                r->ok   = 1;
-                r->pid  = h.pid;
-                r->ppid = h.ppid;
-                r->N    = h.N;
-                r->i    = h.i;
-                printf("[pid %d, ppid %d] Mi hijo %d me avisa: lo resolvio el Mr. Meeseeks (%d, %d, %d, %d)\n",
-                       getpid(), getppid(), pids[k], h.pid, h.ppid, h.N, h.i);
-            }
+    int    restantes = creados;
+    int    avisados  = 0;          /* 1 = ya les dije a mis hijos que terminen */
+
+    while (restantes > 0) {
+        struct pollfd p[MAX_HIJOS + 1];
+        p[0].fd = avisados ? -1 : fd_entrada;   /* fd negativo = poll lo ignora */
+        p[0].events = POLLIN;
+        for (int k = 0; k < creados; k++) {
+            p[k + 1].fd = activo[k] ? lee[k] : -1;
+            p[k + 1].events = POLLIN;
         }
-        close(lee[k]);
-        waitpid(pids[k], NULL, 0);
+        if (poll(p, creados + 1, -1) < 0) continue;
+
+        /* Mi padre me ordena terminar: reenvio la orden a todos mis hijos */
+        if (p[0].revents) {
+            printf("[pid %d, ppid %d] Mi padre dice que termine; aviso a mis hijos.\n",
+                   getpid(), getppid());
+            avisar_hijos(escribe, pids, activo, creados, -1);
+            avisados = 1;
+            r->cancelado = 1;
+        }
+
+        for (int k = 0; k < creados; k++) {
+            if (!activo[k] || !p[k + 1].revents) continue;
+
+            Resultado h;
+            if (read(lee[k], &h, sizeof h) == sizeof h) {
+                r->creados += h.creados;
+                if (h.espera > espera_hijos) espera_hijos = h.espera;
+                if (h.ok && !r->ok) {      /* el primero que lo logro */
+                    r->ok   = 1;
+                    r->pid  = h.pid;
+                    r->ppid = h.ppid;
+                    r->N    = h.N;
+                    r->i    = h.i;
+                    printf("[pid %d, ppid %d] Mi hijo %d me avisa: lo resolvio el Mr. Meeseeks (%d, %d, %d, %d)\n",
+                           getpid(), getppid(), pids[k], h.pid, h.ppid, h.N, h.i);
+                    if (!avisados) {       /* aviso a los hermanos del que lo logro */
+                        avisar_hijos(escribe, pids, activo, creados, k);
+                        avisados = 1;
+                    }
+                }
+            }
+            activo[k] = 0;
+            restantes--;
+            close(lee[k]);
+            close(escribe[k]);
+            waitpid(pids[k], NULL, 0);
+        }
     }
 
     /* Los hijos trabajan en paralelo: el tiempo dormido que cuenta es el de la
@@ -499,8 +628,7 @@ static void meeseeks(int fd_entrada, int fd_salida, int N, int i) {
            getpid(), getppid(), N, i);
 
     /* read se bloquea hasta que el padre escriba en el pipe */
-    ssize_t n = read(fd_entrada, &m, sizeof m);
-    close(fd_entrada);
+    ssize_t n = read(fd_entrada, &m, sizeof m);   /* el pipe queda abierto para la orden 'T' */
     if (n != sizeof m) {
         printf("[pid %d, ppid %d] No recibi ninguna solicitud\n", getpid(), getppid());
         exit(1);
@@ -521,14 +649,17 @@ static void meeseeks(int fd_entrada, int fd_salida, int N, int i) {
         else
             printf("[pid %d, ppid %d] Error en el calculo: %s\n", getpid(), getppid(), error);
     } else {
-        resolver_textual(&m, N, i, fd_salida, &r);          /* parte A */
+        resolver_textual(&m, N, i, fd_entrada, fd_salida, &r);   /* parte A */
     }
 
     if (r.ok && r.pid == 0) {      /* calc y run: quien resuelve soy yo */
         r.pid = getpid(); r.ppid = getppid(); r.N = N; r.i = i;
     }
 
-    if (!r.ok)
+    if (!r.ok && r.cancelado)
+        printf("[pid %d, ppid %d] Me avisaron que ya no hace falta. Gracias por llamarme!\n",
+               getpid(), getppid());
+    else if (!r.ok)
         printf("[pid %d, ppid %d] Ooh, no pude completar la solicitud.\n",
                getpid(), getppid());
     else if (r.pid == getpid())
@@ -548,6 +679,7 @@ static void meeseeks(int fd_entrada, int fd_salida, int N, int i) {
     /* Comunica el resultado al padre por el pipe de vuelta */
     if (write(fd_salida, &r, sizeof r) < 0) perror("write");
     close(fd_salida);
+    close(fd_entrada);
     registrar_muerte();
     exit(r.ok ? 0 : 1);
 }
@@ -574,12 +706,50 @@ static double preguntar(const char *texto, double min, double max) {
     return v;
 }
 
-int main(void) {
+/* CAOS PLANETARIO: se acabo el tiempo maximo. Primero se pide a todos que
+ * se despidan (orden 'T' en cascada); a quien no termine en 3 s se le mata
+ * junto con todo su grupo de procesos. Luego el Box cierra el programa. */
+static void caos_planetario(pid_t raiz, int fd_orden, int fd_resultado, double t0,
+                            const char *solicitud) {
+    char orden = ORDEN_TERMINAR;
+
+    printf("\n[Box %d] !!!!! CAOS PLANETARIO !!!!! Se acabo el tiempo maximo.\n", getpid());
+    printf("[Box %d] Hay %d Mr. Meeseeks vivos. Ordeno a todos que desaparezcan.\n",
+           getpid(), shm->vivos);
+    if (write(fd_orden, &orden, 1) < 0) { /* la raiz ya no existe */ }
+
+    struct pollfd p = { .fd = fd_resultado, .events = POLLIN };
+    if (poll(&p, 1, 3000) == 0) {
+        printf("[Box %d] No respondieron a tiempo: los elimino a la fuerza (SIGKILL).\n", getpid());
+    }
+    kill(-raiz, SIGKILL);        /* pid negativo = todo el grupo de procesos */
+    waitpid(raiz, NULL, 0);
+
+    Tarea *t = &bitacora[total++];
+    strcpy(t->texto, solicitud);
+    t->duracion   = ahora() - t0;
+    t->completada = 0;
+    t->caos       = 1;
+    t->meeseeks   = shm->creados;
+    t->max_vivos  = shm->max_vivos;
+    t->nivel_max  = shm->nivel_max;
+}
+
+int main(int argc, char *argv[]) {
     char solicitud[MAX_SOLICITUD];
+
+    double minutos = (argc > 1) ? atof(argv[1]) : MINUTOS_DEF;
+    int    cupo    = (argc > 2) ? atoi(argv[2]) : CUPO_DEF;
+    if (minutos < 0) minutos = MINUTOS_DEF;
+    if (cupo < 1)    cupo    = CUPO_DEF;
 
     /* Salida por lineas: cada mensaje se imprime de inmediato y ningun hijo
      * hereda texto pendiente en el buffer (evita mensajes duplicados). */
     setvbuf(stdout, NULL, _IOLBF, 0);
+
+    /* Escribir en un pipe cuyo lector ya termino genera SIGPIPE, que mataria
+     * al proceso. Se ignora: write devolvera error y el programa sigue. */
+    signal(SIGPIPE, SIG_IGN);
 
     /* Crea la memoria compartida ANTES de cualquier fork */
     shm = mmap(NULL, sizeof(Compartido), PROT_READ | PROT_WRITE,
@@ -593,11 +763,17 @@ int main(void) {
         perror("sem_init");
         return 1;
     }
+    shm->cupo = cupo;
 #ifdef SIN_SEMAFORO
     printf("*** ATENCION: compilado SIN semaforo (experimento de condicion de carrera) ***\n");
 #endif
 
     printf("=== Box Mr. Meeseeks === (escriba \"adios\" para salir)\n");
+    if (minutos > 0)
+        printf("Tiempo maximo por solicitud: %.2f min | Maximo de Meeseeks vivos: %d\n",
+               minutos, cupo);
+    else
+        printf("Tiempo maximo: SIN LIMITE | Maximo de Meeseeks vivos: %d\n", cupo);
 
     while (1) {
         printf("Box> ");
@@ -625,18 +801,21 @@ int main(void) {
         }
 
         reiniciar_contadores();
+        reservar_cupo(1);        /* el lugar del Mr. Meeseeks original */
         double t0 = ahora();
 
         int baja[2];   /* Box -> Meeseeks: el Mensaje   */
         int sube[2];   /* Meeseeks -> Box: el Resultado */
         if (pipe(baja) < 0) {
             perror("pipe");
+            liberar_cupo(1);
             continue;
         }
         if (pipe(sube) < 0) {
             perror("pipe");
             close(baja[0]);
             close(baja[1]);
+            liberar_cupo(1);
             continue;
         }
 
@@ -647,9 +826,13 @@ int main(void) {
             perror("fork");
             close(baja[0]); close(baja[1]);
             close(sube[0]); close(sube[1]);
+            liberar_cupo(1);
             continue;
         }
         if (pid == 0) {
+            /* Grupo de procesos propio: todos sus descendientes lo heredan,
+             * asi el Box puede eliminarlos de un solo golpe en el caos. */
+            setpgid(0, 0);
             close(baja[1]);                        /* el hijo lee de "baja"...   */
             close(sube[0]);                        /* ...y escribe en "sube"     */
             meeseeks(baja[0], sube[1], 1, 1);      /* nivel 1, instancia 1 */
@@ -659,15 +842,38 @@ int main(void) {
         close(baja[0]);
         close(sube[1]);
         if (write(baja[1], &m, sizeof m) < 0) perror("write");
-        close(baja[1]);
+        /* baja[1] se mantiene abierto: si se cerrara, el Meeseeks lo tomaria
+         * como orden de terminar. Se cierra cuando la solicitud concluye. */
 
-        /* espera la respuesta; read devuelve 0 si el hijo murio sin contestar */
+        setpgid(pid, pid);       /* lo mismo desde el padre, por si el padre corre primero */
+
+        /* espera la respuesta, pero no mas alla del tiempo maximo */
+        int listo = 1;
+        if (minutos > 0) {
+            for (;;) {
+                double resta = minutos * 60.0 - (ahora() - t0);
+                if (resta <= 0) { listo = 0; break; }
+                struct pollfd p = { .fd = sube[0], .events = POLLIN };
+                int n = poll(&p, 1, (int)(resta * 1000) + 1);
+                if (n > 0) break;
+            }
+        }
+        if (!listo) {
+            caos_planetario(pid, baja[1], sube[0], t0, solicitud);
+            close(sube[0]);
+            close(baja[1]);
+            printf("[Box %d] Fin del programa por caos planetario.\n", getpid());
+            break;
+        }
+
+        /* read devuelve 0 si el hijo murio sin contestar */
         Resultado r;
         if (read(sube[0], &r, sizeof r) != sizeof r) {
             memset(&r, 0, sizeof r);
             r.creados = 1;
         }
         close(sube[0]);
+        close(baja[1]);
 
         waitpid(pid, NULL, 0);   /* recoge al hijo para que no quede zombie */
         double t1 = ahora();
@@ -687,6 +893,9 @@ int main(void) {
         printf("[Box %d] Meeseeks creados: %d (verificacion por pipes: %d) | "
                "maximo simultaneos: %d | vivos ahora: %d\n",
                getpid(), shm->creados, r.creados, shm->max_vivos, shm->vivos);
+        if (shm->sin_cupo > 0)
+            printf("[Box %d] Contingencia: %d veces se nego ayuda por falta de cupo\n",
+                   getpid(), shm->sin_cupo);
         printf("[Box %d] Por nivel:", getpid());
         for (int n = 1; n <= shm->nivel_max && n < NIVELES_REG; n++)
             printf(" N%d=%d", n, shm->por_nivel[n]);
