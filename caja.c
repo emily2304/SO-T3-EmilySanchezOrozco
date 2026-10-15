@@ -17,6 +17,9 @@
 #include <time.h>
 #include <ctype.h>
 #include <math.h>
+#include <sched.h>
+#include <semaphore.h>
+#include <sys/mman.h>
 
 #define MAX_SOLICITUD 256
 #define MAX_TAREAS    100
@@ -41,12 +44,78 @@ typedef struct {
     int    N, i;
 } Resultado;
 
+/* ------------------------------------------------------------------
+ * Variables compartidas entre TODOS los procesos (Box y Mr. Meeseeks).
+ * Viven en memoria creada con mmap(MAP_SHARED) antes de cualquier fork,
+ * asi que todos los hijos ven la misma memoria fisica (no una copia).
+ * El semaforo "mutex" garantiza que solo un proceso a la vez las modifica.
+ * ------------------------------------------------------------------ */
+#define NIVELES_REG 64
+
+typedef struct {
+    sem_t mutex;                    /* semaforo binario administrado por el SO */
+    int   creados;                  /* Meeseeks creados en la solicitud actual */
+    int   vivos;                    /* Meeseeks existiendo en este momento     */
+    int   max_vivos;                /* el mayor valor que alcanzo "vivos"      */
+    int   nivel_max;                /* nivel mas profundo alcanzado            */
+    int   por_nivel[NIVELES_REG];   /* cuantos se crearon en cada nivel        */
+} Compartido;
+
+static Compartido *shm;   /* puntero a la memoria compartida */
+
+static void bloquear(void) {
+#ifndef SIN_SEMAFORO
+    while (sem_wait(&shm->mutex) < 0) ;   /* reintenta si una senal lo interrumpe */
+#endif
+}
+
+static void desbloquear(void) {
+#ifndef SIN_SEMAFORO
+    sem_post(&shm->mutex);
+#endif
+}
+
+/* Un Meeseeks nace: se anota en los contadores (seccion critica).
+ * Se usa leer -> ceder CPU -> escribir para que, sin semaforo, la condicion
+ * de carrera sea visible en los experimentos. */
+static void registrar_nacimiento(int N) {
+    bloquear();
+    int c = shm->creados;
+    int v = shm->vivos;
+    sched_yield();
+    shm->creados = c + 1;
+    shm->vivos   = v + 1;
+    if (shm->vivos > shm->max_vivos) shm->max_vivos = shm->vivos;
+    if (N > shm->nivel_max)          shm->nivel_max = N;
+    if (N < NIVELES_REG)             shm->por_nivel[N]++;
+    desbloquear();
+}
+
+/* Un Meeseeks desaparece. */
+static void registrar_muerte(void) {
+    bloquear();
+    int v = shm->vivos;
+    sched_yield();
+    shm->vivos = v - 1;
+    desbloquear();
+}
+
+/* El Box deja los contadores en cero antes de cada solicitud. */
+static void reiniciar_contadores(void) {
+    bloquear();
+    shm->creados = shm->vivos = shm->max_vivos = shm->nivel_max = 0;
+    memset(shm->por_nivel, 0, sizeof shm->por_nivel);
+    desbloquear();
+}
+
 /* Un registro por cada solicitud atendida; con esto se arma el informe final. */
 typedef struct {
     char   texto[MAX_SOLICITUD];
     double duracion;     /* segundos reales */
     int    completada;   /* 1 = si, 0 = no */
     int    meeseeks;     /* cuantos Mr. Meeseeks se crearon para esta tarea */
+    int    max_vivos;    /* cuantos existieron al mismo tiempo, como maximo */
+    int    nivel_max;    /* nivel mas profundo alcanzado */
 } Tarea;
 
 static Tarea bitacora[MAX_TAREAS];
@@ -57,12 +126,13 @@ static void informe(void) {
     int hechas = 0;
 
     printf("\n================ INFORME DEL BOX ================\n");
-    printf("%-3s %-30s %12s %-10s %8s\n", "#", "Solicitud", "Duracion(s)", "Estado", "Meeseeks");
+    printf("%-3s %-30s %12s %-10s %8s %6s %6s\n",
+           "#", "Solicitud", "Duracion(s)", "Estado", "Meeseeks", "MaxSim", "Nivel");
     for (int k = 0; k < total; k++) {
-        printf("%-3d %-30.30s %12.6f %-10s %8d\n", k + 1, bitacora[k].texto,
+        printf("%-3d %-30.30s %12.6f %-10s %8d %6d %6d\n", k + 1, bitacora[k].texto,
                bitacora[k].duracion,
                bitacora[k].completada ? "Terminada" : "Fallida",
-               bitacora[k].meeseeks);
+               bitacora[k].meeseeks, bitacora[k].max_vivos, bitacora[k].nivel_max);
         hechas += bitacora[k].completada;
     }
     printf("-------------------------------------------------\n");
@@ -423,6 +493,8 @@ static void meeseeks(int fd_entrada, int fd_salida, int N, int i) {
      * heredarian la misma secuencia de numeros "al azar" del padre. */
     srand((unsigned)(getpid() ^ time(NULL)));
 
+    registrar_nacimiento(N);       /* contador global protegido con semaforo */
+
     printf("Hi, I'm Mr. Meeseeks! Look at Meeeee. (%d, %d, %d, %d)\n",
            getpid(), getppid(), N, i);
 
@@ -476,6 +548,7 @@ static void meeseeks(int fd_entrada, int fd_salida, int N, int i) {
     /* Comunica el resultado al padre por el pipe de vuelta */
     if (write(fd_salida, &r, sizeof r) < 0) perror("write");
     close(fd_salida);
+    registrar_muerte();
     exit(r.ok ? 0 : 1);
 }
 
@@ -508,6 +581,22 @@ int main(void) {
      * hereda texto pendiente en el buffer (evita mensajes duplicados). */
     setvbuf(stdout, NULL, _IOLBF, 0);
 
+    /* Crea la memoria compartida ANTES de cualquier fork */
+    shm = mmap(NULL, sizeof(Compartido), PROT_READ | PROT_WRITE,
+               MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (shm == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+    /* pshared = 1: el semaforo se comparte entre procesos; valor inicial 1 (libre) */
+    if (sem_init(&shm->mutex, 1, 1) < 0) {
+        perror("sem_init");
+        return 1;
+    }
+#ifdef SIN_SEMAFORO
+    printf("*** ATENCION: compilado SIN semaforo (experimento de condicion de carrera) ***\n");
+#endif
+
     printf("=== Box Mr. Meeseeks === (escriba \"adios\" para salir)\n");
 
     while (1) {
@@ -535,6 +624,7 @@ int main(void) {
             m.espera     = preguntar("  Tiempo en segundos (Enter = al azar 0.5-5): ", 0.0, 3600.0);
         }
 
+        reiniciar_contadores();
         double t0 = ahora();
 
         int baja[2];   /* Box -> Meeseeks: el Mensaje   */
@@ -587,14 +677,25 @@ int main(void) {
         strcpy(t->texto, solicitud);
         t->duracion   = (t1 - t0) - r.espera;   /* tiempo real sin la espera simulada */
         t->completada = r.ok;
-        t->meeseeks   = r.creados;
+        t->meeseeks   = shm->creados;   /* todos ya terminaron: nadie mas lo modifica */
+        t->max_vivos  = shm->max_vivos;
+        t->nivel_max  = shm->nivel_max;
         int ok = r.ok;
 
         printf("[Box %d] Solicitud %d %s en %.6f s\n",
                getpid(), total, ok ? "completada" : "NO completada", t->duracion);
+        printf("[Box %d] Meeseeks creados: %d (verificacion por pipes: %d) | "
+               "maximo simultaneos: %d | vivos ahora: %d\n",
+               getpid(), shm->creados, r.creados, shm->max_vivos, shm->vivos);
+        printf("[Box %d] Por nivel:", getpid());
+        for (int n = 1; n <= shm->nivel_max && n < NIVELES_REG; n++)
+            printf(" N%d=%d", n, shm->por_nivel[n]);
+        printf("\n");
     }
 
     informe();
+    sem_destroy(&shm->mutex);
+    munmap(shm, sizeof(Compartido));
     printf("[Box %d] Adios!\n", getpid());
     return 0;
 }
